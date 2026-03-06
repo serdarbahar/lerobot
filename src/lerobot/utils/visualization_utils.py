@@ -14,34 +14,21 @@
 
 import numbers
 import os
+from typing import Any
 
 import numpy as np
 import rerun as rr
 
-from lerobot.processor import RobotAction, RobotObservation
-
-from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
+from .constants import OBS_PREFIX, OBS_STR
 
 
-def init_rerun(
-    session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
-) -> None:
-    """
-    Initializes the Rerun SDK for visualizing the control loop.
-
-    Args:
-        session_name: Name of the Rerun session.
-        ip: Optional IP for connecting to a Rerun server.
-        port: Optional port for connecting to a Rerun server.
-    """
+def init_rerun(session_name: str = "lerobot_control_loop") -> None:
+    """Initializes the Rerun SDK for visualizing the control loop."""
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
     rr.init(session_name)
     memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
-    if ip and port:
-        rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
-    else:
-        rr.spawn(memory_limit=memory_limit)
+    rr.spawn(memory_limit=memory_limit)
 
 
 def _is_scalar(x):
@@ -51,9 +38,8 @@ def _is_scalar(x):
 
 
 def log_rerun_data(
-    observation: RobotObservation | None = None,
-    action: RobotAction | None = None,
-    compress_images: bool = False,
+    observation: dict[str, Any] | None = None,
+    action: dict[str, Any] | None = None,
 ) -> None:
     """
     Logs observation and action data to Rerun for real-time visualization.
@@ -62,7 +48,7 @@ def log_rerun_data(
     to the Rerun viewer. It handles different data types appropriately:
     - Scalars values (floats, ints) are logged as `rr.Scalars`.
     - 3D NumPy arrays that resemble images (e.g., with 1, 3, or 4 channels first) are transposed
-      from CHW to HWC format, (optionally) compressed to JPEG and logged as `rr.Image` or `rr.EncodedImage`.
+      from CHW to HWC format and logged as `rr.Image`.
     - 1D NumPy arrays are logged as a series of individual scalars, with each element indexed.
     - Other multi-dimensional arrays are flattened and logged as individual scalars.
 
@@ -71,7 +57,6 @@ def log_rerun_data(
     Args:
         observation: An optional dictionary containing observation data to log.
         action: An optional dictionary containing action data to log.
-        compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
     """
     if observation:
         for k, v in observation.items():
@@ -90,14 +75,13 @@ def log_rerun_data(
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
-                    img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
-                    rr.log(key, entity=img_entity, static=True)
+                    rr.log(key, rr.Image(arr), static=True)
 
     if action:
         for k, v in action.items():
             if v is None:
                 continue
-            key = k if str(k).startswith(ACTION_PREFIX) else f"{ACTION}.{k}"
+            key = k if str(k).startswith("action.") else f"action.{k}"
 
             if _is_scalar(v):
                 rr.log(key, rr.Scalars(float(v)))

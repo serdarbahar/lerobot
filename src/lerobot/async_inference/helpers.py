@@ -18,7 +18,6 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import torch
 
@@ -40,8 +39,8 @@ from lerobot.utils.utils import init_logging
 
 Action = torch.Tensor
 
-# observation as received from the robot (can be numpy arrays, floats, etc.)
-RawObservation = dict[str, Any]
+# observation as received from the robot
+RawObservation = dict[str, torch.Tensor]
 
 # observation as those recorded in LeRobot dataset (keys are different)
 LeRobotObservation = dict[str, torch.Tensor]

@@ -14,30 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-import importlib.metadata
 import logging
+import pkgutil
 from typing import Any
 
 from draccus.choice_types import ChoiceRegistry
 
 
-def is_package_available(
-    pkg_name: str, import_name: str | None = None, return_version: bool = False
-) -> tuple[bool, str] | bool:
-    """
+def is_package_available(pkg_name: str, return_version: bool = False) -> tuple[bool, str] | bool:
+    """Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/utils/import_utils.py
     Check if the package spec exists and grab its version to avoid importing a local directory.
-
-    Args:
-        pkg_name: The name of the package as installed via pip (e.g. "python-can").
-        import_name: The actual name used to import the package (e.g. "can").
-                     Defaults to pkg_name if not provided.
-        return_version: Whether to return the version string.
+    **Note:** this doesn't work for all packages.
     """
-    if import_name is None:
-        import_name = pkg_name
-
-    # Check if the module spec exists using the import name
-    package_exists = importlib.util.find_spec(import_name) is not None
+    package_exists = importlib.util.find_spec(pkg_name) is not None
     package_version = "N/A"
     if package_exists:
         try:
@@ -48,7 +37,7 @@ def is_package_available(
             # Fallback method: Only for "torch" and versions containing "dev"
             if pkg_name == "torch":
                 try:
-                    package = importlib.import_module(import_name)
+                    package = importlib.import_module(pkg_name)
                     temp_version = getattr(package, "__version__", "N/A")
                     # Check if the version contains "dev"
                     if "dev" in temp_version:
@@ -59,6 +48,9 @@ def is_package_available(
                 except ImportError:
                     # If the package can't be imported, it's not available
                     package_exists = False
+            elif pkg_name == "grpc":
+                package = importlib.import_module(pkg_name)
+                package_version = getattr(package, "__version__", "N/A")
             else:
                 # For packages other than "torch", don't attempt the fallback and set as not available
                 package_exists = False
@@ -71,9 +63,6 @@ def is_package_available(
 
 _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")
-_scipy_available = is_package_available("scipy")
-_reachy2_sdk_available = is_package_available("reachy2_sdk")
-_can_available = is_package_available("python-can", "can")
 
 
 def make_device_from_device_class(config: ChoiceRegistry) -> Any:
@@ -141,32 +130,26 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     )
 
 
-def register_third_party_plugins() -> None:
+def register_third_party_devices() -> None:
     """
-    Discover and import third-party LeRobot plugins so they can register themselves.
+    Discover and import third-party lerobot_* plugins so they can register themselves.
 
-    This function uses `importlib.metadata` to find packages installed in the environment
-    (including editable installs) starting with 'lerobot_robot_', 'lerobot_camera_',
-    'lerobot_teleoperator_', or 'lerobot_policy_' and imports them.
+    Scans top-level modules on sys.path for packages starting with
+    'lerobot_robot_', 'lerobot_camera_' or 'lerobot_teleoperator_' and imports them.
     """
-    prefixes = ("lerobot_robot_", "lerobot_camera_", "lerobot_teleoperator_", "lerobot_policy_")
+    prefixes = ("lerobot_robot_", "lerobot_camera_", "lerobot_teleoperator_")
     imported: list[str] = []
     failed: list[str] = []
 
-    def attempt_import(module_name: str):
-        try:
-            importlib.import_module(module_name)
-            imported.append(module_name)
-            logging.info("Imported third-party plugin: %s", module_name)
-        except Exception:
-            logging.exception("Could not import third-party plugin: %s", module_name)
-            failed.append(module_name)
-
-    for dist in importlib.metadata.distributions():
-        dist_name = dist.metadata.get("Name")
-        if not dist_name:
-            continue
-        if dist_name.startswith(prefixes):
-            attempt_import(dist_name)
+    for module_info in pkgutil.iter_modules():
+        name = module_info.name
+        if name.startswith(prefixes):
+            try:
+                importlib.import_module(name)
+                imported.append(name)
+                logging.info("Imported third-party plugin: %s", name)
+            except Exception:
+                logging.exception("Could not import third-party plugin: %s", name)
+                failed.append(name)
 
     logging.debug("Third-party plugin import summary: imported=%s failed=%s", imported, failed)

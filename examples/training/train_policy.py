@@ -24,6 +24,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.factory import make_pre_post_processors
+from tqdm import tqdm
 
 
 def main():
@@ -95,20 +96,22 @@ def main():
     # Run training loop.
     step = 0
     done = False
-    while not done:
-        for batch in dataloader:
-            batch = preprocessor(batch)
-            loss, _ = policy.forward(batch)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+    with tqdm(total=training_steps) as pbar:
+        while not done:
+            for batch in dataloader:
+                batch = preprocessor(batch)
+                loss, _ = policy.forward(batch)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
 
-            if step % log_freq == 0:
-                print(f"step: {step} loss: {loss.item():.3f}")
-            step += 1
-            if step >= training_steps:
-                done = True
-                break
+                if step % log_freq == 0:
+                    tqdm.write(f"step: {step} loss: {loss.item():.3f}")
+                step += 1
+                if step >= training_steps:
+                    done = True
+                    break
+                pbar.update(1)
 
     # Save a policy checkpoint.
     policy.save_pretrained(output_directory)

@@ -13,8 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import dataclasses
 import logging
+import os
+import subprocess
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -24,7 +25,6 @@ import torch
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
-from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -38,7 +38,6 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
-from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
@@ -52,7 +51,6 @@ from lerobot.utils.utils import (
     format_big_number,
     has_method,
     init_logging,
-    inside_slurm,
 )
 
 
@@ -65,7 +63,6 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
-    rabc_weights_provider=None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -82,7 +79,6 @@ def update_policy(
         accelerator: The Accelerator instance for distributed training and mixed precision.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
-        rabc_weights_provider: Optional RABCWeights instance for sample weighting.
 
     Returns:
         A tuple containing:
@@ -92,30 +88,9 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
-    # Get RA-BC weights if enabled
-    rabc_batch_weights = None
-    rabc_batch_stats = None
-    if rabc_weights_provider is not None:
-        rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
-
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
-            # Get per-sample losses
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
-
-            # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
-            # rabc_batch_weights is already normalized to sum to batch_size
-            epsilon = 1e-6
-            loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
-            # Log raw mean weight (before normalization) - this is the meaningful metric
-            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
-        else:
-            loss, output_dict = policy.forward(batch)
-
+        loss, output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
     # Use accelerator's backward method
@@ -169,6 +144,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
     cfg.validate()
 
+    # Hack to fix "NotImplementedError: Using RTX 4000 series doesn't support faster communication broadband via P2P or IB"
+    if accelerator is None:
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0 and ("RTX 40" in result.stdout or "RTX 4000" in result.stdout):
+                if "NCCL_P2P_DISABLE" not in os.environ:
+                    os.environ["NCCL_P2P_DISABLE"] = "1"
+                    logging.info("Disabling NCCL P2P for RTX 4000 series")
+                if "NCCL_IB_DISABLE" not in os.environ:
+                    os.environ["NCCL_IB_DISABLE"] = "1"
+                    logging.info("Disabling NCCL IB for RTX 4000 series")
+        except Exception:
+            pass
+
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
@@ -177,14 +166,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         from accelerate.utils import DistributedDataParallelKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
-        # Force the device to be CPU when policy.device is set to CPU.
-        force_cpu = cfg.policy.device == "cpu"
-        accelerator = Accelerator(
-            step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
-            cpu=force_cpu,
-        )
+        accelerator = Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
 
     init_logging(accelerator=accelerator)
 
@@ -227,8 +209,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
     eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
-        logging.info("Creating env")
+    if cfg.eval_freq > 0 and cfg.env is not None:
+        if is_main_process:
+            logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     if is_main_process:
@@ -239,12 +222,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         rename_map=cfg.rename_map,
     )
 
-    if cfg.peft is not None:
-        logging.info("Using PEFT! Wrapping model.")
-        # Convert CLI peft config to dict for overrides
-        peft_cli_overrides = dataclasses.asdict(cfg.peft)
-        policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
-
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
@@ -254,10 +231,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
-
-    # For SARM, always provide dataset_meta for progress normalization
-    if cfg.policy.type == "sarm":
-        processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
@@ -290,29 +263,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
-    # Load precomputed SARM progress for RA-BC if enabled
-    # Generate progress using: src/lerobot/policies/sarm/compute_rabc_weights.py
-    rabc_weights = None
-    if cfg.use_rabc:
-        from lerobot.utils.rabc import RABCWeights
-
-        # Get chunk_size from policy config
-        chunk_size = getattr(policy.config, "chunk_size", None)
-        if chunk_size is None:
-            raise ValueError("Chunk size is not found in policy config")
-
-        head_mode = getattr(cfg, "rabc_head_mode", "sparse")
-        logging.info(f"Loading SARM progress for RA-BC from {cfg.rabc_progress_path}")
-        logging.info(f"Using chunk_size={chunk_size} from policy config, head_mode={head_mode}")
-        rabc_weights = RABCWeights(
-            progress_path=cfg.rabc_progress_path,
-            chunk_size=chunk_size,
-            head_mode=head_mode,
-            kappa=getattr(cfg, "rabc_kappa", 0.01),
-            epsilon=getattr(cfg, "rabc_epsilon", 1e-6),
-            device=device,
-        )
-
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -326,9 +276,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
-            env_preprocessor, env_postprocessor = make_env_pre_post_processors(
-                env_cfg=cfg.env, policy_cfg=cfg.policy
-            )
+            env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env)
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
@@ -380,10 +328,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
 
-    # Keep global batch size for logging; MetricsTracker handles world size internally.
+    # Use effective batch size for proper epoch calculation in distributed training
     effective_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
-        cfg.batch_size,
+        effective_batch_size,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
@@ -392,17 +340,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
 
     if is_main_process:
-        progbar = tqdm(
-            total=cfg.steps - step,
-            desc="Training",
-            unit="step",
-            disable=inside_slurm(),
-            position=0,
-            leave=True,
-        )
-        logging.info(
-            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
-        )
+        logging.info("Start offline training on a fixed dataset")
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
@@ -418,14 +356,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
-            rabc_weights_provider=rabc_weights,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
-        if is_main_process:
-            progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
@@ -437,16 +372,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
-                # Log RA-BC statistics if enabled
-                if rabc_weights is not None:
-                    rabc_stats = rabc_weights.get_stats()
-                    wandb_log_dict.update(
-                        {
-                            "rabc_delta_mean": rabc_stats["delta_mean"],
-                            "rabc_delta_std": rabc_stats["delta_std"],
-                            "rabc_num_frames": rabc_stats["num_frames"],
-                        }
-                    )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
@@ -519,9 +444,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             accelerator.wait_for_everyone()
 
-    if is_main_process:
-        progbar.close()
-
     if eval_env:
         close_envs(eval_env)
 
@@ -530,10 +452,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if cfg.policy.push_to_hub:
             unwrapped_policy = accelerator.unwrap_model(policy)
-            if cfg.policy.use_peft:
-                unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
-            else:
-                unwrapped_policy.push_model_to_hub(cfg)
+            unwrapped_policy.push_model_to_hub(cfg)
             preprocessor.push_to_hub(cfg.policy.repo_id)
             postprocessor.push_to_hub(cfg.policy.repo_id)
 
@@ -543,7 +462,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
 
 def main():
-    register_third_party_plugins()
     train()
 
 

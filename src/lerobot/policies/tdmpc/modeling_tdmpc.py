@@ -65,7 +65,6 @@ class TDMPCPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: TDMPCConfig,
-        **kwargs,
     ):
         """
         Args:

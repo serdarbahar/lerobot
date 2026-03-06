@@ -25,8 +25,6 @@ import metaworld.policies as policies
 import numpy as np
 from gymnasium import spaces
 
-from lerobot.processor import RobotObservation
-
 # ---- Load configuration data from the external JSON file ----
 CONFIG_PATH = Path(__file__).parent / "metaworld_config.json"
 try:
@@ -163,7 +161,7 @@ class MetaworldEnv(gym.Env):
         env._freeze_rand_vec = False  # otherwise no randomization
         return env
 
-    def _format_raw_obs(self, raw_obs: np.ndarray) -> RobotObservation:
+    def _format_raw_obs(self, raw_obs: np.ndarray) -> dict[str, Any]:
         image = None
         if self._env is not None:
             image = self._env.render()
@@ -198,7 +196,7 @@ class MetaworldEnv(gym.Env):
         self,
         seed: int | None = None,
         **kwargs,
-    ) -> tuple[RobotObservation, dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """
         Reset the environment to its initial state.
 
@@ -206,7 +204,7 @@ class MetaworldEnv(gym.Env):
             seed (Optional[int]): Random seed for environment initialization.
 
         Returns:
-            observation (RobotObservation): The initial formatted observation.
+            observation (Dict[str, Any]): The initial formatted observation.
             info (Dict[str, Any]): Additional info about the reset state.
         """
         super().reset(seed=seed)
@@ -218,7 +216,7 @@ class MetaworldEnv(gym.Env):
         info = {"is_success": False}
         return observation, info
 
-    def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
+    def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """
         Perform one environment step.
 
@@ -226,7 +224,7 @@ class MetaworldEnv(gym.Env):
             action (np.ndarray): The action to execute, must be 1-D with shape (action_dim,).
 
         Returns:
-            observation (RobotObservation): The formatted observation after the step.
+            observation (Dict[str, Any]): The formatted observation after the step.
             reward (float): The scalar reward for this step.
             terminated (bool): Whether the episode terminated successfully.
             truncated (bool): Whether the episode was truncated due to a time limit.
